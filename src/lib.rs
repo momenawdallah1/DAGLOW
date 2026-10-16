@@ -1,38 +1,47 @@
-//! Glow Lab: a multi-scale glow (bloom) effect for EffectCraft (Plug-in API v1).
+//! Glow Lab 2: a multi-scale glow (bloom) effect for EffectCraft (Plug-in API v1).
 //!
 //! Written from scratch. The method is the standard bloom pipeline:
 //!   1. bright-pass with a soft knee,
-//!   2. a pyramid of progressively smaller, separately blurred copies,
-//!   3. a weighted sum of the levels (Falloff sets the weights),
-//!   4. add the result over the layer, tinted and scaled by Intensity.
+//!   2. a pyramid of progressively smaller, blurred copies (each level is wider on screen),
+//!   3. Radius decides how many of the wide levels take part, Spread weights them,
+//!   4. blend the result over the layer (Screen, Add or Lighten), tinted by Tint.
 //!
 //! No imports, no dependencies, deterministic float maths.
 
 use core::cell::UnsafeCell;
 
-const LEVELS: usize = 5;
+const LEVELS: usize = 7;
 const KERNEL: [f32; 5] = [0.227_027, 0.194_594_6, 0.121_621_6, 0.054_054, 0.016_216];
-/// Number of flattened f64 parameters: 5 sliders + colour (4) + checkbox.
-const NPARAMS: usize = 10;
+/// Flattened f64 parameters: 4 sliders/popup..., see the manifest order below.
+const NPARAMS: usize = 13;
+/// Overall strength at Exposure 1.0.
+const BASE_GAIN: f32 = 3.0;
 
 const MANIFEST: &str = r#"{
   "api": 1,
   "id": "com.glowlab.multiscale-glow",
   "name": "Glow Lab",
   "category": "Stylize",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "Glow Lab",
-  "description": "Multi-scale glow: bright-pass, five blurred scales, additive blend.",
+  "description": "Multi-scale glow with a pixel radius, spread, threshold and blend modes.",
   "params": [
-    {"id": "threshold", "name": "Threshold", "type": "slider", "default": 0.55, "min": 0, "max": 1, "decimals": 2},
-    {"id": "softness", "name": "Softness", "type": "slider", "default": 0.15, "min": 0, "max": 0.5, "decimals": 2},
-    {"id": "intensity", "name": "Intensity", "type": "slider", "default": 1.4, "min": 0, "max": 20, "sliderMax": 4, "decimals": 2},
-    {"id": "radius", "name": "Radius", "type": "slider", "default": 1.5, "min": 0, "max": 20, "sliderMax": 4, "decimals": 2},
-    {"id": "falloff", "name": "Falloff", "type": "slider", "default": 0.75, "min": 0.3, "max": 1.1, "decimals": 2},
+    {"id": "radius", "name": "Radius", "type": "slider", "default": 250, "min": 0, "max": 5000, "sliderMax": 1000, "decimals": 0},
+    {"id": "exposure", "name": "Exposure", "type": "slider", "default": 1.0, "min": 0, "max": 50, "sliderMax": 5, "decimals": 2},
+    {"id": "threshold", "name": "Threshold", "type": "slider", "default": 50, "min": 0, "max": 100, "decimals": 0},
+    {"id": "threshold_smooth", "name": "Threshold Smooth", "type": "slider", "default": 50, "min": 0, "max": 100, "decimals": 0},
+    {"id": "blend_mode", "name": "Blend Mode", "type": "popup", "options": ["Screen", "Add", "Lighten"], "default": 0},
+    {"id": "aspect_ratio", "name": "Aspect Ratio", "type": "slider", "default": 1.0, "min": 0.2, "max": 5, "decimals": 2},
+    {"id": "spread", "name": "Spread", "type": "slider", "default": 33, "min": 0, "max": 100, "decimals": 0},
     {"id": "tint", "name": "Tint", "type": "color", "default": [1.0, 1.0, 1.0, 1.0]},
-    {"id": "glow_only", "name": "Glow Only", "type": "checkbox", "default": false}
+    {"id": "view", "name": "View", "type": "popup", "options": ["Final Render", "Glow Only", "Source"], "default": 0},
+    {"id": "source_opacity", "name": "Source Opacity", "type": "slider", "default": 100, "min": 0, "max": 100, "decimals": 0}
   ]
 }"#;
+
+// Flattened parameter order:
+//  0 radius | 1 exposure | 2 threshold | 3 threshold smooth | 4 blend mode | 5 aspect ratio
+//  6 spread | 7..10 tint rgba | 11 view | 12 source opacity
 
 // ---------------------------------------------------------------------------
 // ABI exports
@@ -185,8 +194,9 @@ fn blur_axis(src: &[f32], w: usize, h: usize, step: f32, horizontal: bool) -> Ve
     out
 }
 
-/// dst += gain * bilinear_upsample(src)
-fn upsample_add(dst: &mut [f32], dw: usize, dh: usize, src: &[f32], sw: usize, sh: usize, gain: [f32; 4]) {
+/// Bilinearly samples `src` (sw x sh) at every pixel of a dw x dh grid and calls
+/// `f(offset_of_pixel_in_dst, value)`.
+fn upsample_map<F: FnMut(usize, [f32; 4])>(dw: usize, dh: usize, src: &[f32], sw: usize, sh: usize, mut f: F) {
     for y in 0..dh {
         let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
         let y0 = fy as usize;
@@ -201,18 +211,27 @@ fn upsample_add(dst: &mut [f32], dw: usize, dh: usize, src: &[f32], sw: usize, s
             let i10 = (y0 * sw + x1) * 4;
             let i01 = (y1 * sw + x0) * 4;
             let i11 = (y1 * sw + x1) * 4;
-            let o = (y * dw + x) * 4;
+            let mut v = [0.0f32; 4];
             for c in 0..4 {
                 let top = src[i00 + c] + (src[i10 + c] - src[i00 + c]) * tx;
                 let bot = src[i01 + c] + (src[i11 + c] - src[i01 + c]) * tx;
-                dst[o + c] += (top + (bot - top) * ty) * gain[c];
+                v[c] = top + (bot - top) * ty;
             }
+            f((y * dw + x) * 4, v);
         }
     }
 }
 
 fn scaled(v: &[f32], k: f32) -> Vec<f32> {
     v.iter().map(|x| x * k).collect()
+}
+
+fn mix(mode: u8, s: f32, g: f32) -> f32 {
+    match mode {
+        0 => s + g - s * g, // Screen
+        1 => s + g,         // Add
+        _ => s.max(g),      // Lighten
+    }
 }
 
 /// Core of the effect, separated from the raw-pointer ABI so it can be unit-tested.
@@ -222,16 +241,29 @@ pub fn render(px: &mut [f32], w: usize, h: usize, p: &[f64], scale: f64) -> Resu
     }
     let px = &mut px[..w * h * 4];
 
-    let thr = fin(p[0], 0.0, 1.0);
-    let knee = fin(p[1], 0.0, 0.5);
-    let intensity = fin(p[2], 0.0, 50.0);
-    let radius = fin(p[3], 0.0, 50.0);
-    let falloff = fin(p[4], 0.05, 1.5);
-    let tint = [fin(p[5], 0.0, 10.0), fin(p[6], 0.0, 10.0), fin(p[7], 0.0, 10.0)];
-    let glow_only = p[9] > 0.5;
+    let radius = fin(p[0], 0.0, 5000.0);
+    let exposure = fin(p[1], 0.0, 50.0);
+    let thr = fin(p[2], 0.0, 100.0) / 100.0;
+    let knee = fin(p[3], 0.0, 100.0) / 100.0 * 0.3;
+    let blend = (p[4] as i64).clamp(0, 2) as u8;
+    let aspect = fin(p[5], 0.2, 5.0);
+    let spread = fin(p[6], 0.0, 100.0);
+    let tint = [fin(p[7], 0.0, 10.0), fin(p[8], 0.0, 10.0), fin(p[9], 0.0, 10.0)];
+    let view = (p[11] as i64).clamp(0, 2);
+    let opacity = fin(p[12], 0.0, 100.0) / 100.0;
     let sc = if scale.is_finite() && scale > 0.0 { scale as f32 } else { 1.0 };
-    // Tap spacing in buffer pixels at each pyramid level; scales with preview resolution.
-    let step = radius * sc;
+
+    // View: Source only needs the opacity.
+    if view == 2 {
+        for v in px.iter_mut() {
+            *v *= opacity;
+        }
+        return Ok(());
+    }
+
+    // Aspect Ratio stretches the blur: > 1 widens horizontally, < 1 vertically.
+    let step_h = aspect.sqrt();
+    let step_v = 1.0 / aspect.sqrt();
 
     // 1 + 2: bright-pass folded into the first downsample, then blur each level.
     let (mut cur, mut cw, mut ch) = down(w, h, |x, y| {
@@ -241,8 +273,8 @@ pub fn render(px: &mut [f32], w: usize, h: usize, p: &[f64], scale: f64) -> Resu
     let mut levels: Vec<Vec<f32>> = Vec::with_capacity(LEVELS);
     let mut dims: Vec<(usize, usize)> = Vec::with_capacity(LEVELS);
     for i in 0..LEVELS {
-        let t = blur_axis(&cur, cw, ch, step, true);
-        let b = blur_axis(&t, cw, ch, step, false);
+        let t = blur_axis(&cur, cw, ch, step_h, true);
+        let b = blur_axis(&t, cw, ch, step_v, false);
         let next = if i + 1 < LEVELS {
             Some(down(cw, ch, |x, y| {
                 let j = (y * cw + x) * 4;
@@ -260,7 +292,9 @@ pub fn render(px: &mut [f32], w: usize, h: usize, p: &[f64], scale: f64) -> Resu
         }
     }
 
-    // 3: weights from Falloff, normalised; fold levels from coarse to fine.
+    // 3: Spread weights the levels; Radius gates the wide levels in or out.
+    // Level i is d = 2^(i+1) times smaller than the frame and blurs to about 2.07 * d pixels.
+    let falloff = 0.45 + 0.01 * spread;
     let mut ws = [0.0f32; LEVELS];
     let mut pw = 1.0f32;
     let mut sum = 0.0f32;
@@ -269,29 +303,45 @@ pub fn render(px: &mut [f32], w: usize, h: usize, p: &[f64], scale: f64) -> Resu
         sum += pw;
         pw *= falloff;
     }
-    for wi in ws.iter_mut() {
-        *wi = *wi / sum * 2.2;
+    let reach = (radius * sc).max(1.0) * 0.6;
+    let mut d = 2.0f32;
+    for i in 0..LEVELS {
+        let r = 2.07 * d / reach;
+        let r2 = r * r;
+        let gate = 1.0 / (1.0 + r2 * r2);
+        ws[i] = ws[i] / sum * BASE_GAIN * gate;
+        d *= 2.0;
     }
+
+    // Fold the levels from coarse to fine into one glow image at the finest level.
     let mut acc = scaled(&levels[LEVELS - 1], ws[LEVELS - 1]);
     for i in (0..LEVELS - 1).rev() {
         let mut here = scaled(&levels[i], ws[i]);
-        upsample_add(&mut here, dims[i].0, dims[i].1, &acc, dims[i + 1].0, dims[i + 1].1, [1.0; 4]);
+        upsample_map(dims[i].0, dims[i].1, &acc, dims[i + 1].0, dims[i + 1].1, |o, v| {
+            for c in 0..4 {
+                here[o + c] += v[c];
+            }
+        });
         acc = here;
     }
 
-    // 4: add over the layer (or replace it, in Glow Only mode).
-    if glow_only {
+    // 4: Source Opacity applies to the visible source, not to what feeds the glow.
+    if opacity < 1.0 {
         for v in px.iter_mut() {
-            *v = 0.0;
+            *v *= opacity;
         }
     }
-    let gain = [tint[0] * intensity, tint[1] * intensity, tint[2] * intensity, intensity];
-    upsample_add(px, w, h, &acc, dims[0].0, dims[0].1, gain);
-    for i in (3..px.len()).step_by(4) {
-        if px[i] > 1.0 {
-            px[i] = 1.0;
+    let gains = [tint[0] * exposure, tint[1] * exposure, tint[2] * exposure, exposure];
+    let glow_only = view == 1;
+    upsample_map(w, h, &acc, dims[0].0, dims[0].1, |o, g| {
+        for c in 0..4 {
+            let gl = g[c] * gains[c];
+            px[o + c] = if glow_only { gl } else { mix(blend, px[o + c], gl) };
         }
-    }
+        if px[o + 3] > 1.0 {
+            px[o + 3] = 1.0;
+        }
+    });
     Ok(())
 }
 
@@ -299,7 +349,9 @@ pub fn render(px: &mut [f32], w: usize, h: usize, p: &[f64], scale: f64) -> Resu
 mod tests {
     use super::*;
 
-    const DEFAULTS: [f64; NPARAMS] = [0.55, 0.15, 1.4, 1.5, 0.75, 1.0, 1.0, 1.0, 1.0, 0.0];
+    // radius 20, exposure 1, threshold 50, smooth 50, Screen, aspect 1, spread 33,
+    // tint white, Final Render, opacity 100
+    const DEFAULTS: [f64; NPARAMS] = [20.0, 1.0, 50.0, 50.0, 0.0, 1.0, 33.0, 1.0, 1.0, 1.0, 1.0, 0.0, 100.0];
 
     fn dot_image(n: usize) -> Vec<f32> {
         let mut px = vec![0.0f32; n * n * 4];
@@ -326,18 +378,32 @@ mod tests {
         let mut px = dot_image(n);
         render(&mut px, n, n, &DEFAULTS, 1.0).unwrap();
         let at = |x: usize, y: usize| px[(y * n + x) * 4];
-        assert!(at(n / 2, n / 2) >= 1.0);
-        assert!(at(n / 2 + 3, n / 2) > 0.001, "glow should reach nearby pixels");
-        assert!(at(n / 2 + 3, n / 2) > at(n / 2 + 20, n / 2), "glow should fall off with distance");
+        assert!(at(n / 2, n / 2) >= 0.999);
+        assert!(at(n / 2 + 3, n / 2) > 1e-4, "glow should reach nearby pixels");
+        assert!(at(n / 2 + 3, n / 2) > at(n / 2 + 25, n / 2), "glow should fall off with distance");
     }
 
     #[test]
-    fn zero_intensity_leaves_the_image_unchanged() {
+    fn larger_radius_reaches_further() {
+        let n = 128;
+        let mut small = dot_image(n);
+        let mut large = dot_image(n);
+        let mut p = DEFAULTS;
+        p[0] = 8.0;
+        render(&mut small, n, n, &p, 1.0).unwrap();
+        p[0] = 250.0;
+        render(&mut large, n, n, &p, 1.0).unwrap();
+        let far = (n / 2 * n + n / 2 + 40) * 4;
+        assert!(large[far] > small[far]);
+    }
+
+    #[test]
+    fn zero_exposure_leaves_the_image_unchanged() {
         let n = 32;
         let original = dot_image(n);
         let mut px = original.clone();
         let mut p = DEFAULTS;
-        p[2] = 0.0;
+        p[1] = 0.0;
         render(&mut px, n, n, &p, 1.0).unwrap();
         assert_eq!(px, original);
     }
@@ -364,10 +430,22 @@ mod tests {
         let n = 32;
         let mut px = dot_image(n);
         let mut p = DEFAULTS;
-        p[9] = 1.0;
+        p[11] = 1.0;
         render(&mut px, n, n, &p, 1.0).unwrap();
-        // far corner of an otherwise black frame: only (tiny) glow, no source alpha of 1.0
         assert!(px[3] < 0.5);
+    }
+
+    #[test]
+    fn source_view_only_applies_opacity() {
+        let n = 16;
+        let original = dot_image(n);
+        let mut px = original.clone();
+        let mut p = DEFAULTS;
+        p[11] = 2.0;
+        p[12] = 50.0;
+        render(&mut px, n, n, &p, 1.0).unwrap();
+        let expected: Vec<f32> = original.iter().map(|v| v * 0.5).collect();
+        assert_eq!(px, expected);
     }
 
     #[test]
