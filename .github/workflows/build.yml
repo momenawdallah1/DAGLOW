@@ -24,4 +24,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DA_GLOW
-          path: target/wasm32-unknown-unknown/release/DA_glow.wasm
+          path: target/wasm32-unknown-unknown/release/DA_GLOW.wasm
