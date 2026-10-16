@@ -1,0 +1,18 @@
+[package]
+name = "glow_lab"
+version = "1.0.0"
+edition = "2021"
+description = "Multi-scale glow (bloom) effect plug-in for EffectCraft, written from scratch."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
