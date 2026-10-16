@@ -1,7 +1,7 @@
 [package]
 name = "DA_GLOW"
 version = "1.0.1"
-edition = "2026"
+edition = "2021"
 description = "Multi-scale glow (bloom) effect plug-in for EffectCraft, written from scratch."
 license = "MIT OR Apache-2.0"
 
